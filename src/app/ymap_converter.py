@@ -1,5 +1,6 @@
 # app/ymap_converter.py
 import os
+import sys
 import shutil
 import tempfile
 import subprocess
@@ -8,6 +9,41 @@ from typing import Tuple
 class ConversionError(Exception):
     pass
 
+def find_codewalker(prefer_path: str | None) -> str | None:
+    """
+    Megpróbálja megtalálni a CodeWalker.exe-t.
+    Visszaadja az abszolút elérési utat, ha megtalálta, különben None.
+    """
+    candidates: list[str] = []
+
+    # 1) kézzel megadott út
+    if prefer_path:
+        candidates.append(prefer_path)
+
+    # 2) környezeti változó
+    env = os.environ.get("CODEWALKER_EXE_PATH")
+    if env:
+        candidates.append(env)
+
+    # 3) gyakori helyek
+    home = os.path.expanduser("~")
+    common_dirs = [
+        os.getcwd(),
+        os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.abspath("."),
+        os.path.join(home, "Desktop", "CodeWalker"),
+        os.path.join(home, "CodeWalker"),
+        os.path.join("C:\\", "Program Files", "CodeWalker"),
+        os.path.join("C:\\", "Program Files (x86)", "CodeWalker"),
+    ]
+    for d in common_dirs:
+        candidates.append(os.path.join(d, "CodeWalker.exe"))
+
+    for p in candidates:
+        if p and os.path.isfile(p):
+            return os.path.abspath(p)
+    return None
+
+
 def _is_xml_text(path: str) -> bool:
     try:
         with open(path, "rb") as f:
@@ -15,6 +51,7 @@ def _is_xml_text(path: str) -> bool:
         return head.lstrip().startswith(b"<")
     except Exception:
         return False
+
 
 def ensure_xml_from_ymap(input_path: str, codewalker_path: str | None) -> Tuple[str, str]:
     """
@@ -45,24 +82,15 @@ def ensure_xml_from_ymap(input_path: str, codewalker_path: str | None) -> Tuple[
     # A CW sok mindent relatív elérési úttal keres – ezért a cwd legyen a CW mappája.
     cw_dir = os.path.dirname(codewalker_path)
 
-    # 1) Megpróbáljuk a (létező) parancssoros exportot: -exportxml <in> <out>
-    # Rejtett módon, és megvárjuk a végét.
-    # Ha a CW nem támogatná, esünk a 2) PowerShell hívásra (szintén rejtve).
+    # 1) Parancssori export megkísérlése rejtve
     args = [codewalker_path, "-exportxml", input_path, out_xml]
-
     try:
-        # Windows alatt teljesen rejtett futtatás
         creation = 0x08000000  # CREATE_NO_WINDOW
-        subprocess.run(
-            args,
-            cwd=cw_dir,
-            check=False,
-            creationflags=creation
-        )
+        subprocess.run(args, cwd=cw_dir, check=False, creationflags=creation)
     except Exception:
-        pass  # megyünk a PS-es útra
+        pass
 
-    # Ha még nincs kimentve, próbáljuk PowerShell-lel rejtve indítani és kivárni
+    # 2) PowerShell-es rejtett indítás, ha még nincs kimenet
     if not (os.path.exists(out_xml) and os.path.getsize(out_xml) > 100):
         ps = (
             f'Start-Process -FilePath "{codewalker_path}" '
@@ -74,7 +102,7 @@ def ensure_xml_from_ymap(input_path: str, codewalker_path: str | None) -> Tuple[
                 ["powershell", "-NoProfile", "-Command", ps],
                 cwd=cw_dir,
                 check=False,
-                creationflags=0x08000000  # CREATE_NO_WINDOW
+                creationflags=0x08000000
             )
         except Exception:
             pass
@@ -82,7 +110,7 @@ def ensure_xml_from_ymap(input_path: str, codewalker_path: str | None) -> Tuple[
     if not (os.path.exists(out_xml) and os.path.getsize(out_xml) > 100):
         raise ConversionError(
             "CodeWalker export sikertelen (nem jött létre használható XML).\n"
-            "Ellenőrizd, hogy a CodeWalker legfrissebb, és hogy a -exportxml működik ennél a verziónál."
+            "Ellenőrizd, hogy a CodeWalker legfrissebb, és hogy a -exportxml működik."
         )
 
     return out_xml, "Bináris .ymap → CodeWalker export (rejtve) sikerült."
