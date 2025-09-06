@@ -1,170 +1,88 @@
+# app/ymap_converter.py
 import os
-import re
 import shutil
-import subprocess
 import tempfile
-
+import subprocess
 from typing import Tuple
 
 class ConversionError(Exception):
     pass
 
-
-def _looks_like_xml_text(data: bytes) -> bool:
-    head = data.lstrip()[:100].lower()
-    return head.startswith(b"<") or b"<map" in head or b"<cmap" in head or b"<?xml" in head
-
-
-def _read_file_bytes(path: str) -> bytes:
-    with open(path, "rb") as f:
-        return f.read()
-
-
-def _write_utf8(path: str, text: str) -> None:
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(text)
-
-
-def _cw_headless_run(args: list, cwd: str | None = None) -> tuple[int, str, str]:
-    """
-    Futtat egy külső programot teljesen ablak nélkül.
-    """
-    # Rejtett indulás Windows alatt
-    startupinfo = None
-    creationflags = 0
+def _is_xml_text(path: str) -> bool:
     try:
-        startupinfo = subprocess.STARTUPINFO()
-        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        creationflags = subprocess.CREATE_NO_WINDOW  # nincs konzolablak
+        with open(path, "rb") as f:
+            head = f.read(256)
+        return head.lstrip().startswith(b"<")
     except Exception:
-        pass
+        return False
 
-    completed = subprocess.run(
-        args,
-        cwd=cwd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        shell=False,
-        startupinfo=startupinfo,
-        creationflags=creationflags,
+def ensure_xml_from_ymap(input_path: str, codewalker_path: str | None) -> Tuple[str, str]:
+    """
+    Ha input XML (ymap.xml vagy sima xml), visszaadjuk.
+    Ha bináris .ymap: CodeWalker -> XML export (rejtve).
+    Visszatérés: (xml_path, status_message)
+    """
+    if not os.path.isfile(input_path):
+        raise ConversionError(f"Nem található: {input_path}")
+
+    # Ha már XML-nek látszik, vagy .xml a kiterjesztés – nem indítunk CW-t.
+    ext = os.path.splitext(input_path)[1].lower()
+    if ext == ".xml" or _is_xml_text(input_path):
+        return input_path, "Forrás már XML volt – CW nem kellett."
+
+    # Bináris .ymap eset -> CodeWalker export szükséges
+    if not codewalker_path or not os.path.isfile(codewalker_path):
+        raise ConversionError(
+            "Bináris .ymap és nincs beállítva érvényes CodeWalker.exe.\n"
+            "Beállítások gomb → válaszd ki a CodeWalker.exe-t."
+        )
+
+    out_xml = os.path.join(
+        tempfile.gettempdir(),
+        os.path.splitext(os.path.basename(input_path))[0] + ".xml",
     )
-    return completed.returncode, completed.stdout, completed.stderr
 
+    # A CW sok mindent relatív elérési úttal keres – ezért a cwd legyen a CW mappája.
+    cw_dir = os.path.dirname(codewalker_path)
 
-def find_codewalker(explicit_path: str | None) -> str | None:
-    """
-    Ha nincs megadva, próbálunk ésszerű helyeken keresni.
-    """
-    candidates: list[str] = []
-    if explicit_path:
-        candidates.append(explicit_path)
+    # 1) Megpróbáljuk a (létező) parancssoros exportot: -exportxml <in> <out>
+    # Rejtett módon, és megvárjuk a végét.
+    # Ha a CW nem támogatná, esünk a 2) PowerShell hívásra (szintén rejtve).
+    args = [codewalker_path, "-exportxml", input_path, out_xml]
 
-    # Gyakori telepítési helyek
-    program_files = os.environ.get("ProgramFiles", r"C:\Program Files")
-    program_files_x86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
-    local_appdata = os.environ.get("LOCALAPPDATA", "")
+    try:
+        # Windows alatt teljesen rejtett futtatás
+        creation = 0x08000000  # CREATE_NO_WINDOW
+        subprocess.run(
+            args,
+            cwd=cw_dir,
+            check=False,
+            creationflags=creation
+        )
+    except Exception:
+        pass  # megyünk a PS-es útra
 
-    for base in [program_files, program_files_x86, local_appdata]:
-        if not base:
-            continue
-        for name in ["CodeWalker", "CodeWalkerGTAV", "CodeWalker-Release", "CodeWalker RPF Explorer"]:
-            exe = os.path.join(base, name, "CodeWalker.exe")
-            if os.path.isfile(exe):
-                candidates.append(exe)
+    # Ha még nincs kimentve, próbáljuk PowerShell-lel rejtve indítani és kivárni
+    if not (os.path.exists(out_xml) and os.path.getsize(out_xml) > 100):
+        ps = (
+            f'Start-Process -FilePath "{codewalker_path}" '
+            f'-ArgumentList \'-exportxml\',\'{input_path}\',\'{out_xml}\' '
+            f'-WorkingDirectory "{cw_dir}" -WindowStyle Hidden -Wait'
+        )
+        try:
+            subprocess.run(
+                ["powershell", "-NoProfile", "-Command", ps],
+                cwd=cw_dir,
+                check=False,
+                creationflags=0x08000000  # CREATE_NO_WINDOW
+            )
+        except Exception:
+            pass
 
-    # A PATH-on is megpróbáljuk
-    for p in os.environ.get("PATH", "").split(os.pathsep):
-        exe = os.path.join(p, "CodeWalker.exe")
-        if os.path.isfile(exe):
-            candidates.append(exe)
-
-    # Dedup & ellenőrzés
-    seen = set()
-    for c in candidates:
-        c = os.path.normpath(c)
-        if c.lower() in seen:
-            continue
-        seen.add(c.lower())
-        if os.path.isfile(c):
-            return c
-    return None
-
-
-def _try_cw_export(cw_exe: str, src: str, dst: str) -> tuple[bool, str]:
-    """
-    Több lehetséges CodeWalker CLI szintaxist is megpróbálunk.
-    Minden hívás NÉMA (ablak nélkül) történik.
-    """
-    cwd = os.path.dirname(cw_exe) or None
-
-    # 1) Régebbi/újabb build-ek között eltérhet a flag; végigpróbáljuk.
-    candidates = [
-        [cw_exe, "-exportxml", src, dst],
-        [cw_exe, "/exportxml", src, dst],
-        [cw_exe, "-convertxml", src, dst],
-        [cw_exe, "/convertxml", src, dst],
-        # Biztonsági „convert” variánsok (ha az XML-t automatikusan kitalálja)
-        [cw_exe, "-convert", src, dst],
-        [cw_exe, "/convert", src, dst],
-    ]
-
-    last_stdout = ""
-    last_stderr = ""
-
-    for cmd in candidates:
-        rc, out, err = _cw_headless_run(cmd, cwd=cwd)
-        last_stdout, last_stderr = out, err
-
-        if rc == 0 and os.path.isfile(dst):
-            try:
-                # Nézzük meg, tényleg XML-t kaptunk-e
-                with open(dst, "rb") as f:
-                    if _looks_like_xml_text(f.read(400)):
-                        return True, ""
-            except Exception:
-                pass
-
-        # Ha a kimenet jelzi, hogy ismeretlen flag, megyünk a következőre
-        if any(k in (out + err).lower() for k in ["unknown option", "invalid", "usage"]):
-            continue
-
-    # semelyik forma nem jött be
-    msg = (last_stdout + "\n" + last_stderr).strip()
-    return False, msg
-
-
-def ensure_xml_from_ymap(src_path: str, cw_path: str | None) -> Tuple[str, str]:
-    """
-    Bemenet: .ymap vagy .ymap.xml
-    Kimenet: (xml_path, info_message)  — mindent ablak nélkül végez.
-    """
-    if not os.path.isfile(src_path):
-        raise ConversionError(f"Nincs ilyen fájl: {src_path}")
-
-    data = _read_file_bytes(src_path)
-
-    # 1) Ha már XML (vagy .ymap.xml), visszaadjuk.
-    if _looks_like_xml_text(data) or src_path.lower().endswith((".xml", ".ymap.xml")):
-        return src_path, "Forrás már XML; nincs konverzió."
-
-    # 2) Bináris .ymap → próbáljuk CodeWalkerrel némán konvertálni
-    cw = find_codewalker(cw_path)
-    if not cw:
+    if not (os.path.exists(out_xml) and os.path.getsize(out_xml) > 100):
         raise ConversionError(
-            "Bináris .ymap és nem találom a CodeWalkert. "
-            "Állíts be CodeWalkert a Beállításokban, vagy adj meg .ymap.xml-t."
+            "CodeWalker export sikertelen (nem jött létre használható XML).\n"
+            "Ellenőrizd, hogy a CodeWalker legfrissebb, és hogy a -exportxml működik ennél a verziónál."
         )
 
-    tmp_dir = tempfile.mkdtemp(prefix="cw_xml_")
-    dst_xml = os.path.join(tmp_dir, os.path.splitext(os.path.basename(src_path))[0] + ".xml")
-
-    ok, msg = _try_cw_export(cw, src_path, dst_xml)
-    if not ok or not os.path.isfile(dst_xml):
-        raise ConversionError(
-            "CodeWalker export sikertelen (némán futott). "
-            "Próbáld friss CodeWalkerrel, vagy adj meg .ymap.xml fájlt.\n\n"
-            f"Utolsó üzenet:\n{msg}"
-        )
-
-    return dst_xml, "CodeWalker headless export kész."
+    return out_xml, "Bináris .ymap → CodeWalker export (rejtve) sikerült."
