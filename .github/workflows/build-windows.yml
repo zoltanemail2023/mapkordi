@@ -8,6 +8,7 @@ on:
 jobs:
   build:
     runs-on: windows-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -23,6 +24,7 @@ jobs:
           pip install -r requirements.txt pyinstaller
 
       - name: Build EXE
+        shell: cmd
         run: |
           pyinstaller --noconfirm --clean --onefile ^
             --name MapKordi ^
@@ -33,11 +35,11 @@ jobs:
       - name: Pack artifact
         run: |
           mkdir out
-          copy dist\MapKordi\MapKordi.exe out\MapKordi.exe
-          copy README.md out\README.md
+          powershell -Command "Compress-Archive -Path dist\MapKordi.exe -DestinationPath out\MapKordi-Windows.zip"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: MapKordi-Windows-zip
-          path: out
+          name: MapKordi-Windows.zip
+          path: out/MapKordi-Windows.zip
+          if-no-files-found: error
